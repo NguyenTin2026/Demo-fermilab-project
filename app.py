@@ -184,7 +184,7 @@ def load_model_and_tokenizer():
     try:
         base_model_name = PeftConfig.from_pretrained(str(adapter_path)).base_model_name_or_path
     except Exception:
-        base_model_name = "Qwen/Qwen3-4B-Instruct-2507"  # fallback repo name
+        base_model_name = "Qwen/Qwen2.5-0.5B-Instruct"  # small CPU-friendly fallback (Streamlit Cloud)
 
     # Pick dtype + device. bf16 on GPU; float32 on CPU (very slow).
     if torch.cuda.is_available():
@@ -194,10 +194,10 @@ def load_model_and_tokenizer():
     else:
         device_map = "cpu"
         dtype = torch.float32
-        dev_label = "CPU/fp32 (very slow)"
-        st.sidebar.error(
-            "No CUDA GPU detected. Running on CPU (very slow). "
-            "Check your SLURM/GPU allocation — without a GPU, bf16 and 4-bit are both slow."
+        dev_label = "CPU/fp32"
+        st.sidebar.info(
+            "Running on CPU (no GPU). Using a small model (Qwen2.5-0.5B) so it stays "
+            "responsive on limited hardware like Streamlit Cloud."
         )
 
     # Option 1: merged model (fastest).
@@ -228,7 +228,7 @@ def load_model_and_tokenizer():
 
     # Option 3: plain base model.
     model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, torch_dtype=dtype, device_map=device_map
+        base_model_name, torch_dtype=dtype, device_map=device_map, low_cpu_mem_usage=True
     )
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     model.eval()

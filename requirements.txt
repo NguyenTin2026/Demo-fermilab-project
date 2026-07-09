@@ -1,11 +1,9 @@
-# Loose version ranges so pip can pick wheels that match whatever Python
-# version Streamlit Cloud uses (currently 3.13). torch on PyPI already runs
-# on CPU, so no special index is needed.
+# Lean deps so the app fits Streamlit Community Cloud's memory limit.
+# No local LLM is loaded on Cloud (a local model OOM-kills the app), so torch /
+# transformers / peft / accelerate are intentionally NOT required here. Answers
+# are generated via the Anthropic API instead (set ANTHROPIC_API_KEY in secrets).
 streamlit>=1.36
-torch>=2.4
-transformers>=4.46
-accelerate>=0.30
-peft>=0.11
+anthropic>=0.40
 pandas>=2.0
 numpy>=1.26
 scikit-learn>=1.3

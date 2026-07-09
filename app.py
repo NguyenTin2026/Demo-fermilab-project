@@ -37,13 +37,28 @@ from threading import Lock, Thread           # run model.generate() in the backg
 from urllib.parse import urlparse
 from datetime import datetime, timezone      # used for chat export (feature 7) and feedback logging (feature 2)
 
-import torch
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components  # lets us embed raw HTML/JS in the app
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
-from peft import PeftModel, PeftConfig
 from retriever import Retriever               # our own RAG search module
+
+# Heavy ML deps are OPTIONAL. On Streamlit Community Cloud (CPU, ~1 GB RAM) we do
+# NOT load a local LLM -- a 0.5B model in fp32 alone exceeds the memory limit and
+# gets the app killed ("Oh no. Error running app."). Instead we answer via the
+# Anthropic API (see load_model_and_tokenizer). These imports are guarded so the
+# app still boots when torch/transformers/peft are not installed at all.
+try:
+    import torch
+except Exception:
+    torch = None
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+except Exception:
+    AutoModelForCausalLM = AutoTokenizer = TextIteratorStreamer = None
+try:
+    from peft import PeftModel, PeftConfig
+except Exception:
+    PeftModel = PeftConfig = None
 
 # ----------------------------------------------------------------------------
 # Optional export dependencies (feature 7 extension: more export formats).
@@ -166,17 +181,82 @@ st.markdown("""
 # ----------------------------------------------------------------------------
 # 2. LOADERS (cached so they run only once)
 # ----------------------------------------------------------------------------
+# Model IDs for the hosted-API backend. Haiku is fast + cheap and is plenty for
+# grounded Q&A over short retrieved context -- ideal for a live demo.
+API_MODEL = "claude-haiku-4-5-20251001"
+
+
+def get_api_key():
+    """Anthropic API key from Streamlit secrets or the environment (either works)."""
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", None)
+    except Exception:
+        key = None
+    return key or os.environ.get("ANTHROPIC_API_KEY")
+
+
+def api_generate(messages, temperature=0.3):
+    """Generate an answer with the Anthropic API from build_messages()-style
+    messages (a system message + user/assistant turns). Light on memory, so it
+    runs fine on Streamlit Cloud."""
+    from anthropic import Anthropic
+
+    system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+    chat = [{"role": m["role"], "content": m["content"]}
+            for m in messages if m.get("role") in ("user", "assistant")]
+    client = Anthropic(api_key=get_api_key())
+    resp = client.messages.create(
+        model=API_MODEL,
+        max_tokens=700,
+        temperature=max(0.0, min(1.0, float(temperature))),
+        system=system or "You are a helpful assistant.",
+        messages=chat or [{"role": "user", "content": "Hello"}],
+    )
+    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+
+
+def grounded_fallback_answer(messages):
+    """No API key and no local model: never fabricate. Return the most relevant
+    passage from the retrieved context that build_messages() embedded in the user
+    message, so the reply is still 100% from the corpus."""
+    user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    m = re.search(r"Context:\n(.*?)\n\nQuestion:", user, re.S)
+    context = (m.group(1) if m else "").strip()
+    if not context:
+        return ("⚠️ No `ANTHROPIC_API_KEY` is configured, so generated answers are off. "
+                "Add the key in **Manage app → Settings → Secrets** to enable full answers. "
+                "Retrieved sources are shown below.")
+    # first non-header line of the top document
+    for line in context.splitlines():
+        s = line.strip()
+        if s and not s.startswith("---") and not s.lower().startswith(("content:", "url:", "title:")):
+            excerpt = s
+            break
+    else:
+        excerpt = context[:600]
+    return ("*(No `ANTHROPIC_API_KEY` set — showing the grounded source passage instead of a "
+            "generated answer. Add the key in Streamlit secrets for full answers.)*\n\n"
+            f"> {excerpt[:700]}")
+
+
 @st.cache_resource
 def load_model_and_tokenizer():
     """
-    Load the model + tokenizer. We try three options, best first:
-      1. A merged fine-tuned model (fastest, self-contained).
-      2. Base model + LoRA adapter -> merged at load time.
-      3. Plain base model (no fine-tuning) as a last resort.
-    Returns: (model, tokenizer, status_label)
-
-    Uses bf16 on GPU (much faster than 4-bit nf4 for a 4B model at inference).
+    Pick the answer backend, best-for-Streamlit-Cloud first:
+      1. Anthropic API  -- if ANTHROPIC_API_KEY is set (recommended; low memory).
+      2. Local model    -- only if torch/transformers are installed AND a GPU is
+                           present (dev/SLURM); never attempted on the free CPU tier.
+      3. Grounded-only  -- no key, no GPU: return corpus passages, never fabricate.
+    Returns: (backend, tokenizer, status_label) where `backend` is the string
+    "api"/"grounded" or an actual local model object.
     """
+    if get_api_key():
+        return "api", None, f"Claude API ({API_MODEL})"
+
+    if torch is None or AutoModelForCausalLM is None or not torch.cuda.is_available():
+        # No GPU / no ML stack -> do not load a local model (would OOM on Cloud).
+        return "grounded", None, "Retrieval-only (grounded, no LLM)"
+
     merged_path = APP_DIR / "ft-qwen3-fermilab" / "merged"
     adapter_path = APP_DIR / "ft-qwen3-fermilab"
 
@@ -635,8 +715,14 @@ def _build_gen_kwargs(temperature):
 def generate_answer(messages, temperature):
     """
     Non-streaming path: returns the full answer at once.
-    Used by the RAG vs No-RAG comparison tab (runs twice, no need to stream).
+    Routes to the Anthropic API or the grounded fallback when no local model is
+    loaded (the Streamlit Cloud case); otherwise uses the local model.
     """
+    if model == "api":
+        return api_generate(messages, temperature)
+    if model == "grounded" or model is None or tokenizer is None:
+        return grounded_fallback_answer(messages)
+
     inputs = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,   # add the marker telling the model to start answering
@@ -661,6 +747,12 @@ def generate_answer_stream(messages, temperature):
     and the streamer would end empty (an empty bubble with no message). We capture
     the error and re-raise it after the loop so the caller can see it and fall back.
     """
+    # API / grounded backends don't stream token-by-token here -> emit the whole
+    # answer once so callers (st.write_stream) still work.
+    if model in ("api", "grounded") or model is None or tokenizer is None:
+        yield generate_answer(messages, temperature)
+        return
+
     inputs = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -1799,7 +1891,7 @@ with tab_chat:
                     # current question, already passed to build_messages separately.
                     history = get_recent_history(exclude_last_n=1)
                     messages = build_messages(user_query, chunks, history=history)
-                    use_stream = torch.cuda.is_available()
+                    use_stream = bool(torch is not None and torch.cuda.is_available())
                     # FIX #2: use a dedicated placeholder for the streamed
                     # answer. If generate() errors mid-stream, we clear the
                     # partial text in this placeholder BEFORE drawing the

@@ -3,3 +3,6 @@ __pycache__/
 corpus_embeddings.npy
 corpus_map.json
 feedback_log.jsonl
+
+# local secrets — never commit
+.streamlit/secrets.toml

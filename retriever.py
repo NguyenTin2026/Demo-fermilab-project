@@ -220,7 +220,10 @@ class Retriever:
                 title_origin = f"{doc.get('title', '')} {doc.get('origin', '')}".lower()
                 full_text = f"{title_origin} {doc.get('text', '')}".lower()
                 if not all(entity in full_text for entity in query_entities):
-                    hybrid_scores[doc_idx] *= 0.05
+                    # Soften the old 0.05 "annihilate" gate to a demotion: a page
+                    # missing one queried entity should rank lower, not vanish
+                    # entirely (this over-filtering was costing Recall@1).
+                    hybrid_scores[doc_idx] *= 0.2
                 elif any(entity in title_origin for entity in query_entities):
                     hybrid_scores[doc_idx] += 0.25
             
@@ -256,14 +259,37 @@ class Retriever:
         }
 
     def _query_entities(self, query):
+        # Words that look capitalized only because they start a sentence or are
+        # RAG/instruction fluff ("Using only the retrieved documents ... what did
+        # the Tevatron discover?"). Without this, "Using" was treated as a
+        # mandatory entity and any page not containing BOTH "using" and the real
+        # entity got crushed by the 0.05 penalty below -- burying correct pages.
         generic = {
             "what", "does", "did", "was", "were", "the", "and", "its", "biggest",
-            "discovery", "experiment", "study", "measure", "measured",
+            "discovery", "experiment", "experiments", "study", "measure", "measured",
+            "how", "why", "when", "where", "which", "who", "whom", "whose", "this",
+            "that", "these", "those", "using", "use", "used", "answer", "explain",
+            "describe", "tell", "list", "give", "name", "based", "according",
+            "please", "show", "find", "provide", "provided", "context", "document",
+            "documents", "retrieved", "adding", "outside", "knowledge", "info",
+            "information", "source", "sources", "summarize", "summary", "about",
+            "from", "with", "into", "only", "without", "can", "could", "would",
+            "should", "there", "their", "they", "you", "your", "primary", "role",
+            "difference", "recently", "recent", "new", "research",
         }
+        tokens = re.findall(r"\b[A-Za-z][A-Za-z0-9]*\b", query)
         entities = []
-        for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]*\b", query):
-            if token.lower() not in generic and any(ch.isupper() for ch in token):
-                entities.append(token.lower())
+        for i, token in enumerate(tokens):
+            low = token.lower()
+            if low in generic:
+                continue
+            # A sentence-initial capitalized word is not a reliable entity signal
+            # unless it's an all-caps acronym (DUNE, NOvA-style tokens survive via
+            # the isupper check below). Skip the very first token otherwise.
+            if i == 0 and not (token.isupper() and len(token) >= 2):
+                continue
+            if any(ch.isupper() for ch in token):
+                entities.append(low)
         return entities
 
 if __name__ == "__main__":
